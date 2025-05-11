@@ -25,6 +25,30 @@ from pipecat.services.cartesia.tts import CartesiaTTSService
 from pipecat.services.llm_service import FunctionCallParams
 from pipecat.services.openai.llm import OpenAILLMService
 from pipecat.transports.services.daily import DailyDialinSettings, DailyParams, DailyTransport
+import time
+from pipecat.frames.frames import OutputAudioRawFrame
+from pipecat.processors.frame_processor import FrameDirection
+from pipecat.pipeline.task import PipelineParams
+from pipecat.frames.frames import TextFrame
+
+from pipecat.processors.frame_processor import FrameProcessor
+from pipecat.frames.frames import UserAudioRawFrame, OutputAudioRawFrame
+
+class ActivityMonitor(FrameProcessor):
+    def __init__(self):
+        super().__init__()
+        self.last_audio_time = time.time()
+
+    def update_activity(self):
+        self.last_audio_time = time.time()
+        logger.debug(f"[ActivityMonitor] Updated last_audio_time: {self.last_audio_time}")
+
+    async def process_frame(self, frame, direction):
+        if isinstance(frame, (UserAudioRawFrame, OutputAudioRawFrame)):
+            self.update_activity()
+        await super().process_frame(frame, direction)
+
+
 
 load_dotenv(override=True)
 
@@ -53,6 +77,17 @@ async def main(
 
     # Initialize the session manager
     session_manager = SessionManager()
+    last_audio_time = time.time()
+    start_time = time.time()
+    silence_events = 0
+    prompt_count = 0
+
+
+    def update_last_audio_time():
+        nonlocal last_audio_time
+        last_audio_time = time.time()
+        logger.debug(f"[ActivityMonitor] Updated last_audio_time: {last_audio_time}")
+
 
     # ------------ TRANSPORT SETUP ------------
 
@@ -125,7 +160,11 @@ async def main(
     system_instruction = """You are Chatbot, a friendly, helpful robot. Your goal is to demonstrate your capabilities in a succinct way. Your output will be converted to audio so don't include special characters in your answers. Respond to what the user said in a creative and helpful way, but keep your responses brief. Start by introducing yourself. If the user ends the conversation, **IMMEDIATELY** call the `terminate_call` function. """
 
     # Initialize LLM
-    llm = OpenAILLMService(api_key=os.getenv("OPENAI_API_KEY"))
+    llm = OpenAILLMService(
+    api_key=os.getenv("OPEN_ROUTER_API_KEY"),
+    base_url=os.getenv("OPEN_ROUTER_BASE_URL", "https://openrouter.ai/api/v1"),
+    model=os.getenv("OPEN_ROUTER_MODEL", "openai/gpt-3.5-turbo")
+)
 
     # Register functions with the LLM
     llm.register_function("terminate_call", terminate_call)
@@ -140,31 +179,95 @@ async def main(
     # ------------ PIPELINE SETUP ------------
 
     # Build pipeline
-    pipeline = Pipeline(
-        [
-            transport.input(),  # Transport user input
-            context_aggregator.user(),  # User responses
-            llm,  # LLM
-            tts,  # TTS
-            transport.output(),  # Transport bot output
-            context_aggregator.assistant(),  # Assistant spoken responses
-        ]
-    )
+    activity_monitor = ActivityMonitor()
+
+    pipeline = Pipeline([
+        transport.input(),
+        activity_monitor,
+        context_aggregator.user(),
+        llm,
+        tts,
+        transport.output(),
+        context_aggregator.assistant(),
+    ])
 
     # Create pipeline task
     task = PipelineTask(pipeline, params=PipelineParams(allow_interruptions=True))
+
+    async def silence_monitor(task, activity_monitor):
+        nonlocal silence_events
+        prompts = 0
+        max_prompts = 3
+        prompt_interval = 10
+        check_interval = 1
+
+        try:
+            logger.debug("Warming up TTS engine...")
+            async for _ in tts.run_tts(" "):
+                break
+            logger.debug("TTS warm-up complete.")
+        except Exception as e:
+            logger.error(f"TTS warm-up failed: {e}")
+
+        while prompts < max_prompts:
+            await asyncio.sleep(check_interval)
+
+            time_since_audio = time.time() - activity_monitor.last_audio_time
+            logger.info(f"Time since last audio: {time_since_audio}")
+
+            if time_since_audio >= prompt_interval:
+                prompts += 1
+                silence_events += 1
+                logger.info(f"No speech detected. Prompt {prompts} of {max_prompts}")
+                
+                try:
+                    async for frame in tts.run_tts("Are you still there?"):
+                        await task.queue_frames([frame])
+                except Exception as e:
+                    logger.error(f"TTS generation failed: {e}")
+                
+                activity_monitor.update_activity()
+
+        logger.info("Ending call due to silence.")
+        await task.queue_frames([EndTaskFrame()])
+        await handle_participant_exit()
+
+
 
     # ------------ EVENT HANDLERS ------------
 
     @transport.event_handler("on_first_participant_joined")
     async def on_first_participant_joined(transport, participant):
-        logger.debug(f"First participant joined: {participant['id']}")
+        nonlocal start_time
+        start_time = time.time()
         await transport.capture_participant_transcription(participant["id"])
         await task.queue_frames([context_aggregator.user().get_context_frame()])
+        logger.debug(f"First participant joined: {participant['id']}")
+        activity_monitor.update_activity()
+        asyncio.create_task(silence_monitor(task, activity_monitor))
+
+    @transport.event_handler("on_transcription_message")
+    async def on_transcription_message(transport, message):
+        nonlocal prompt_count
+        text = message.get("text", "")
+        is_final = message.get("rawResponse", {}).get("is_final", False)
+        if text and is_final:
+            logger.debug(f"Transcription received: {text}")
+            prompt_count += 1
+            activity_monitor.update_activity()
+
 
     @transport.event_handler("on_participant_left")
     async def on_participant_left(transport, participant, reason):
         logger.debug(f"Participant left: {participant}, reason: {reason}")
+        await handle_participant_exit()
+
+    
+    async def handle_participant_exit():
+        duration = time.time() - start_time
+        logger.info(f"Participant left after {duration:.2f} seconds")
+        logger.info(f"Total silence events: {silence_events}")
+        logger.info(f"Total number of prompts: {prompt_count}")
         await task.cancel()
 
     # ------------ RUN PIPELINE ------------
